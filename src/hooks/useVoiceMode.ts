@@ -1,5 +1,5 @@
 import {useCallback, useEffect, useState} from 'react';
-import {AppState, type AppStateStatus} from 'react-native';
+import {AppState, Platform, type AppStateStatus} from 'react-native';
 
 import {toByteArray} from 'base64-js';
 import {comparer, reaction, when} from 'mobx';
@@ -22,7 +22,9 @@ import {TTS_ENGINE_RUNTIME_BYTES} from '../services/tts';
 import {hasVoiceFile} from '../services/tts/voiceFiles';
 import {
   Endpointer,
+  VOICE_AEC_AUDIO_SOURCE,
   VOICE_CAPTURE_SETTLE_MS,
+  VOICE_HOLD_FLUSH_MS,
   VOICE_MIC_WATCHDOG_MS,
   VOICE_START_TIMEOUT_MS,
   isMicGranted,
@@ -37,6 +39,7 @@ import type {
   VoiceTurnOutcome,
   VoiceTurnPort,
 } from '../services/voice';
+import {BargeDetector} from '../services/voice/bargeIn';
 import {CascadeVoiceEngine} from '../services/voice/cascadeEngine';
 import {
   asrStore,
@@ -65,6 +68,13 @@ export interface VoiceEntryActions {
 }
 
 const noop = () => {};
+
+/**
+ * Live mode: the mic stays open while the assistant thinks and speaks, and
+ * talking over it interrupts. Android only, where the echo-cancelling
+ * capture source keeps the assistant's own voice out of the mic.
+ */
+const LIVE_BARGE = Platform.OS === 'android';
 
 const FAILURES: Partial<Record<VoiceTurnOutcome, VoiceError>> = {
   transcribe_failed: 'transcribe_failed',
@@ -123,6 +133,10 @@ class VoiceModeController {
   private releaseAwake: (() => void) | null = null;
   private turn: VoiceTurn | null = null;
   private readonly endpointer = new Endpointer();
+  private readonly barge = new BargeDetector();
+  /** The user talked over the current turn; their words go to the next one. */
+  private barged = false;
+  private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private listener: {remove(): void} | null = null;
   private captureSettled: Promise<void> = Promise.resolve();
   private micStarting: Promise<void> | null = null;
@@ -329,6 +343,9 @@ class VoiceModeController {
     this.session++;
     this.micRetried = false;
     this.pausedByInterruption = false;
+    this.barged = false;
+    this.barge.reset();
+    this.clearHoldTimer();
     this.setPhase('closed', reason);
     this.stopCapture();
     const turn = this.turn;
@@ -379,12 +396,11 @@ class VoiceModeController {
     const muted = !voiceModeStore.micMuted;
     voiceModeStore.setMicMuted(muted);
     this.pausedByInterruption = false;
-    if (voiceModeStore.phase !== 'listening') {
-      return;
-    }
     if (muted) {
       this.stopCapture();
-    } else {
+      return;
+    }
+    if (voiceModeStore.phase === 'listening') {
       this.micRetried = false;
       this.startCapture(this.session);
     }
@@ -524,6 +540,7 @@ class VoiceModeController {
         bitsPerSample: ASR_BITS_PER_SAMPLE,
         bufferSize: ASR_CHUNK_BYTES,
         wavFile: '',
+        ...(LIVE_BARGE ? {audioSource: VOICE_AEC_AUDIO_SOURCE} : {}),
       });
       if (!this.isListening(session) || this.listener) {
         return;
@@ -535,9 +552,7 @@ class VoiceModeController {
         }
         this.clearMicWatchdog();
         this.micRetried = false;
-        if (this.endpointer.push(toByteArray(chunk)) === 'endpoint') {
-          this.endUtterance(session, 'auto');
-        }
+        this.onAudio(session, toByteArray(chunk));
       });
       AudioRecord.start();
       vtrace('mic.open');
@@ -581,17 +596,85 @@ class VoiceModeController {
     );
   }
 
+  private onAudio(session: number, chunk: Uint8Array): void {
+    const phase = voiceModeStore.phase;
+    if (phase === 'listening' || this.barged) {
+      const result = this.endpointer.push(chunk);
+      if (this.endpointer.voicedMs > 0) {
+        this.clearHoldTimer();
+      }
+      if (result === 'endpoint' && phase === 'listening') {
+        this.endUtterance(session, 'auto');
+      }
+    } else if (
+      (phase === 'thinking' || phase === 'speaking') &&
+      this.turn &&
+      this.barge.push(chunk)
+    ) {
+      vtrace('interrupt', {src: 'barge', phase});
+      this.barged = true;
+      for (const heard of this.barge.take()) {
+        this.endpointer.push(heard);
+      }
+      this.turn.interrupt();
+    }
+  }
+
+  private clearHoldTimer(): void {
+    if (this.holdTimer) {
+      clearTimeout(this.holdTimer);
+      this.holdTimer = null;
+    }
+  }
+
+  /** After a held, unfinished sentence: send it if the user stays quiet. */
+  private armHoldFlush(session: number): void {
+    this.clearHoldTimer();
+    this.holdTimer = setTimeout(() => {
+      this.holdTimer = null;
+      if (
+        session === this.session &&
+        voiceModeStore.phase === 'listening' &&
+        this.endpointer.voicedMs === 0 &&
+        this.engine.hasHeld
+      ) {
+        vtrace('hold.flush');
+        this.startTurn(session, new Uint8Array(0), 'hold_flush', false);
+      }
+    }, VOICE_HOLD_FLUSH_MS);
+  }
+
   private endUtterance(session: number, by: 'auto' | 'tap'): void {
     vtrace('utt.end', {by, voicedMs: this.endpointer.voicedMs});
-    const utterance = this.endpointer.take();
-    this.stopCapture();
+    const overAssistant = this.barged;
+    this.barged = false;
+    this.startTurn(session, this.endpointer.take(), by, overAssistant);
+  }
+
+  private startTurn(
+    session: number,
+    utterance: Uint8Array,
+    by: string,
+    overAssistant: boolean,
+  ): void {
+    this.clearHoldTimer();
+    this.barge.reset();
+    if (!LIVE_BARGE) {
+      this.stopCapture();
+    }
     this.setPhase('transcribing', by);
     const current = () => session === this.session;
-    const turn = this.engine.runTurn(utterance, this.turnPort, {
-      transcribed: () => current() && this.setPhase('thinking', 'transcribed'),
-      speechStarted: () =>
-        current() && this.setPhase('speaking', 'speech_started'),
-    });
+    const turn = this.engine.runTurn(
+      utterance,
+      this.turnPort,
+      {
+        transcribed: () =>
+          current() && this.setPhase('thinking', 'transcribed'),
+        speechStarted: () =>
+          current() && this.setPhase('speaking', 'speech_started'),
+      },
+      {overAssistant},
+    );
     this.turn = turn;
     turn.done
       .catch((): VoiceTurnOutcome => 'reply_failed')
@@ -601,10 +684,14 @@ class VoiceModeController {
           return;
         }
         this.turn = null;
+        this.barge.reset();
         this.setPhase('listening', outcome);
         const error = FAILURES[outcome];
         if (error) {
           voiceModeStore.setLastError(error);
+        }
+        if (outcome === 'held') {
+          this.armHoldFlush(session);
         }
         this.startCapture(session);
       });

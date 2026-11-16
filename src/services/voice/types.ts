@@ -3,6 +3,8 @@ import type {AsrTier} from '../asr';
 /** How one voice turn ended. Failures name the stage that failed. */
 export type VoiceTurnOutcome =
   | 'empty'
+  /** The local turn gate kept an unfinished sentence for the next utterance. */
+  | 'held'
   | 'answered'
   | 'interrupted'
   | 'transcribe_failed'
@@ -43,9 +45,16 @@ export interface VoiceEngine {
   prepare(tier: AsrTier): Promise<void>;
   /** Frees them; resolves once any in-flight decode has stopped. */
   release(): Promise<void>;
+  /**
+   * An empty `utterance` sends the held text, if any. `overAssistant` marks
+   * speech that interrupted the assistant.
+   */
   runTurn(
     utterance: Uint8Array,
     port: VoiceTurnPort,
     on: VoiceTurnEvents,
+    opts?: {overAssistant?: boolean},
   ): VoiceTurn;
+  /** True while the gate holds an unfinished sentence. */
+  readonly hasHeld: boolean;
 }

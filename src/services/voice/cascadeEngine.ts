@@ -7,6 +7,7 @@ import {getEngine, ttsRuntime} from '../tts';
 import {asrStore, chatSessionStore, ttsStore} from '../../store';
 import {vtrace} from '../../utils/voiceTrace';
 
+import {decideTurn} from './turnGate';
 import type {
   VoiceEngine,
   VoiceTurn,
@@ -33,6 +34,11 @@ const findTurn = (turnId: string) => {
 export class CascadeVoiceEngine implements VoiceEngine {
   readonly id = 'cascade';
   private tier: AsrTier | null = null;
+  private held = '';
+
+  get hasHeld(): boolean {
+    return this.held !== '';
+  }
 
   async prepare(tier: AsrTier): Promise<void> {
     this.tier = tier;
@@ -54,6 +60,7 @@ export class CascadeVoiceEngine implements VoiceEngine {
 
   async release(): Promise<void> {
     this.tier = null;
+    this.held = '';
     await whisperAsrEngine.release();
     if (!ttsStore.streamsReplies) {
       await ttsRuntime.release();
@@ -64,6 +71,7 @@ export class CascadeVoiceEngine implements VoiceEngine {
     utterance: Uint8Array,
     port: VoiceTurnPort,
     on: VoiceTurnEvents,
+    {overAssistant = false}: {overAssistant?: boolean} = {},
   ): VoiceTurn {
     let aborted = false;
     let turnId: string | null = null;
@@ -92,7 +100,11 @@ export class CascadeVoiceEngine implements VoiceEngine {
       return interrupting;
     };
 
-    const run = async (): Promise<VoiceTurnOutcome> => {
+    /** The heard text, '' for no speech, or the failure outcome. */
+    const transcribe = async (): Promise<{text: string} | VoiceTurnOutcome> => {
+      if (utterance.length === 0) {
+        return {text: ''};
+      }
       const vad = energyVad(int16PcmToFloat32(utterance));
       vtrace('vad', {
         passed: vad.passed,
@@ -100,7 +112,7 @@ export class CascadeVoiceEngine implements VoiceEngine {
         ms: Math.round(vad.durationMs),
       });
       if (!vad.passed) {
-        return 'empty';
+        return {text: ''};
       }
       let transcript: AsrTranscript;
       try {
@@ -121,11 +133,29 @@ export class CascadeVoiceEngine implements VoiceEngine {
       if (aborted) {
         return 'interrupted';
       }
-      const text = transcript.text.trim();
-      vtrace('asr', {chars: text.length, rawChars: transcript.text.length});
-      if (!text) {
+      vtrace('asr', {
+        chars: transcript.text.trim().length,
+        rawChars: transcript.text.length,
+      });
+      return {text: transcript.text};
+    };
+
+    const run = async (): Promise<VoiceTurnOutcome> => {
+      const heard = await transcribe();
+      if (typeof heard === 'string') {
+        return heard;
+      }
+      const decision = decideTurn(heard.text, {held: this.held, overAssistant});
+      vtrace('gate', {action: decision.action, reason: decision.reason});
+      if (decision.action === 'ignore') {
         return 'empty';
       }
+      if (decision.action === 'hold') {
+        this.held = decision.text;
+        return 'held';
+      }
+      this.held = '';
+      const text = decision.text;
       on.transcribed(text);
       const stopWatching = when(
         () => {

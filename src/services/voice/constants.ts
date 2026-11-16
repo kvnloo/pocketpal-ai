@@ -28,6 +28,23 @@ export const VOICE_FIRST_CHUNK_MAX_WORDS: Readonly<Record<Tier, number>> = {
   low: 12,
 };
 
+/**
+ * Talking over the assistant interrupts it after this much loud speech (ms)
+ * at this RMS (3x the speech floor). Android only: its echo-cancelling
+ * capture source keeps the assistant's voice out of the mic.
+ */
+export const VOICE_BARGE_MIN_MS = 350;
+export const VOICE_BARGE_RMS = 0.03;
+
+/** Android `MediaRecorder.AudioSource.VOICE_COMMUNICATION` (echo cancelled). */
+export const VOICE_AEC_AUDIO_SOURCE = 7;
+
+/**
+ * A turn the gate held as unfinished ("so I was thinking and…") is sent
+ * anyway after this much more silence (ms).
+ */
+export const VOICE_HOLD_FLUSH_MS = 1800;
+
 /** Silence after speech that ends an utterance (ms). */
 export const VOICE_ENDPOINT_HANG_MS = 600;
 

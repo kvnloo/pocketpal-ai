@@ -83,7 +83,12 @@ describe('VoiceModeStore', () => {
     Platform.OS = platform;
   });
 
-  it('is locked by default', () => {
+  it('is free by default, without Plus', () => {
+    expect(voiceModeStore.isUnlocked).toBe(true);
+  });
+
+  it('the dev override can still lock it', () => {
+    voiceModeStore.setUnlockOverride(false);
     expect(voiceModeStore.isUnlocked).toBe(false);
   });
 
@@ -102,15 +107,11 @@ describe('VoiceModeStore', () => {
     expect(source.openPaywall).toHaveBeenCalledWith({onUnlocked});
   });
 
-  it('unlocks with Plus', () => {
-    runInAction(() => {
-      mockPurchaseStore.plusUnlocked = true;
-    });
-    expect(voiceModeStore.isUnlocked).toBe(true);
+  it('does not depend on Plus', () => {
     runInAction(() => {
       mockPurchaseStore.plusUnlocked = false;
     });
-    expect(voiceModeStore.isUnlocked).toBe(false);
+    expect(voiceModeStore.isUnlocked).toBe(true);
   });
 
   it('opens the Plus screen as its paywall', () => {
